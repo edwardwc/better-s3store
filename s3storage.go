@@ -1,7 +1,9 @@
-package magicstorage
+package s3store
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -9,12 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3iface"
-	cm "github.com/mholt/certmagic"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	cm "github.com/caddyserver/certmagic"
 )
 
 const lockFileExists = "Lock file for already exists"
@@ -37,51 +39,70 @@ var StorageKeys cm.KeyBuilder
 // S3Storage is safe to use with multiple servers behind an AWS load balancer
 // and is safe for concurrent use
 
-type S3Storage struct {
-	Path   string
+type S3Store struct {
+	prefix string
 	bucket *string
-	svc    s3iface.S3API
+	client *s3.Client
 }
 
-func NewS3Storage(bucketName, aws_region string) *S3Storage {
-	cfg := aws.NewConfig()
-	cfg.Region = aws.String(aws_region)
-	sess, err := session.NewSession(cfg)
+func NewS3Store(bucketName, region string) *S3Store {
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(region),
+	)
 	if err != nil {
-		panic(err)
+		log.Fatal(err)
 	}
-	svc := s3.New(sess)
-
-	store := &S3Storage{
+	client := s3.NewFromConfig(cfg)
+	store := &S3Store{
 		bucket: aws.String(bucketName),
-		svc:    svc,
-		Path:   "certmagic",
+		client: client,
+		prefix: "certmagic",
+	}
+
+	return store
+}
+
+func NewS3StoreWithCredentials(accessKey, secretKey, bucketName, region string) *S3Store {
+	cfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+		config.WithRegion(region),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	client := s3.NewFromConfig(cfg)
+	store := &S3Store{
+		bucket: aws.String(bucketName),
+		client: client,
+		prefix: "certmagic",
 	}
 
 	return store
 }
 
 // Exists returns true if key exists in s3
-func (s *S3Storage) Exists(key string) bool {
-	_, err := s.svc.GetObject(&s3.GetObjectInput{
+func (s *S3Store) Exists(key string) bool {
+	input := &s3.GetObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(s.Filename(key)),
-	})
+	}
+	_, err := s.client.GetObject(context.Background(), input)
 	if err == nil {
 		return true
 	}
-	aerr, _ := err.(awserr.Error)
-	return !(aerr.Code() == s3.ErrCodeNoSuchKey)
+	var nsk *types.NoSuchKey
+	return !errors.As(err, &nsk)
 }
 
 // Store saves value at key.
-func (s *S3Storage) Store(key string, value []byte) error {
+func (s *S3Store) Store(key string, value []byte) error {
 	filename := s.Filename(key)
-	_, err := s.svc.PutObject(&s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(filename),
 		Body:   bytes.NewReader(value),
-	})
+	}
+	_, err := s.client.PutObject(context.Background(), input)
 
 	if err != nil {
 		return err
@@ -90,11 +111,12 @@ func (s *S3Storage) Store(key string, value []byte) error {
 }
 
 // Load retrieves the value at key.
-func (s *S3Storage) Load(key string) ([]byte, error) {
-	result, err := s.svc.GetObject(&s3.GetObjectInput{
+func (s *S3Store) Load(key string) ([]byte, error) {
+	input := &s3.GetObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(s.Filename(key)),
-	})
+	}
+	result, err := s.client.GetObject(context.Background(), input)
 	if err != nil {
 		return nil, err
 	}
@@ -107,11 +129,12 @@ func (s *S3Storage) Load(key string) ([]byte, error) {
 }
 
 // Delete deletes the value at key.
-func (s *S3Storage) Delete(key string) error {
-	_, err := s.svc.DeleteObject(&s3.DeleteObjectInput{
+func (s *S3Store) Delete(key string) error {
+	input := &s3.DeleteObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(s.Filename(key)),
-	})
+	}
+	_, err := s.client.DeleteObject(context.Background(), input)
 	if err != nil {
 		return err
 	}
@@ -122,14 +145,15 @@ func (s *S3Storage) Delete(key string) error {
 // because s3 has no concept of directories, everything is an explicit path,
 // there is really no such thing as recursive search. This is simply
 // here to fulfill the interface requirements of the List function
-func (s *S3Storage) List(prefix string, recursive bool) ([]string, error) {
+func (s *S3Store) List(prefix string, recursive bool) ([]string, error) {
 	var keys []string
-
 	prefixPath := s.Filename(prefix)
-	result, err := s.svc.ListObjects(&s3.ListObjectsInput{
+	input := &s3.ListObjectsInput{
 		Bucket: s.bucket,
 		Prefix: aws.String(prefixPath),
-	})
+	}
+
+	result, err := s.client.ListObjects(context.Background(), input)
 	if err != nil {
 		return nil, err
 	}
@@ -143,12 +167,12 @@ func (s *S3Storage) List(prefix string, recursive bool) ([]string, error) {
 }
 
 // Stat returns information about key.
-func (s *S3Storage) Stat(key string) (cm.KeyInfo, error) {
-
-	result, err := s.svc.GetObject(&s3.GetObjectInput{
+func (s *S3Store) Stat(key string) (cm.KeyInfo, error) {
+	input := &s3.GetObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(key),
-	})
+	}
+	result, err := s.client.GetObject(context.Background(), input)
 
 	if err != nil {
 		return cm.KeyInfo{}, err
@@ -156,7 +180,7 @@ func (s *S3Storage) Stat(key string) (cm.KeyInfo, error) {
 
 	return cm.KeyInfo{
 		Key:        key,
-		Size:       *result.ContentLength,
+		Size:       result.ContentLength,
 		Modified:   *result.LastModified,
 		IsTerminal: true,
 	}, nil
@@ -164,13 +188,13 @@ func (s *S3Storage) Stat(key string) (cm.KeyInfo, error) {
 
 // Filename returns the key as a path on the file
 // system prefixed by S3Storage.Path.
-func (s *S3Storage) Filename(key string) string {
-	return filepath.Join(s.Path, filepath.FromSlash(key))
+func (s *S3Store) Filename(key string) string {
+	return filepath.Join(s.prefix, filepath.FromSlash(key))
 }
 
 // Lock obtains a lock named by the given key. It blocks
 // until the lock can be obtained or an error is returned.
-func (s *S3Storage) Lock(key string) error {
+func (s *S3Store) Lock(ctx context.Context, key string) error {
 	start := time.Now()
 	lockFile := s.lockFileName(key)
 
@@ -221,37 +245,38 @@ func (s *S3Storage) Lock(key string) error {
 }
 
 // Unlock releases the lock for name.
-func (s *S3Storage) Unlock(key string) error {
+func (s *S3Store) Unlock(key string) error {
 	return s.deleteLockFile(s.lockFileName(key))
 }
 
-func (s *S3Storage) String() string {
-	return "S3Storage:" + s.Path
+func (s *S3Store) String() string {
+	return "S3Storage:" + s.prefix
 }
 
-func (s *S3Storage) lockFileName(key string) string {
+func (s *S3Store) lockFileName(key string) string {
 	return filepath.Join(s.lockDir(), StorageKeys.Safe(key)+".lock")
 }
 
-func (s *S3Storage) lockDir() string {
-	return filepath.Join(s.Path, "locks")
+func (s *S3Store) lockDir() string {
+	return filepath.Join(s.prefix, "locks")
 }
 
-func (s *S3Storage) fileLockIsStale(info cm.KeyInfo) bool {
+func (s *S3Store) fileLockIsStale(info cm.KeyInfo) bool {
 	return time.Since(info.Modified) > staleLockDuration
 }
 
-func (s *S3Storage) createLockFile(filename string) error {
+func (s *S3Store) createLockFile(filename string) error {
 	//lf := s.lockFileName(key)
 	exists := s.Exists(filename)
 	if exists {
 		return fmt.Errorf(lockFileExists)
 	}
-	_, err := s.svc.PutObject(&s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(filename),
 		Body:   bytes.NewReader([]byte("lock")),
-	})
+	}
+	_, err := s.client.PutObject(context.Background(), input)
 
 	if err != nil {
 		return err
@@ -259,24 +284,22 @@ func (s *S3Storage) createLockFile(filename string) error {
 	return nil
 }
 
-func (s *S3Storage) deleteLockFile(keyPath string) error {
-	_, err := s.svc.DeleteObject(&s3.DeleteObjectInput{
+func (s *S3Store) deleteLockFile(keyPath string) error {
+	input := &s3.DeleteObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(keyPath),
-	})
+	}
+	_, err := s.client.DeleteObject(context.Background(), input)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s *S3Storage) errNoSuchKey(err error) bool {
+func (s *S3Store) errNoSuchKey(err error) bool {
+	var nsk *types.NoSuchKey
 	if err != nil {
-		aerr, ok := err.(awserr.Error)
-		if !ok {
-			return false
-		}
-		if aerr.Code() == s3.ErrCodeNoSuchKey {
+		if errors.As(err, &nsk) {
 			return true
 		}
 	}

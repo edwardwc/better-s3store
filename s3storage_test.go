@@ -1,1 +1,1 @@
-package magicstorage
+package s3store
