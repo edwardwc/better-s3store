@@ -81,12 +81,12 @@ func NewS3StoreWithCredentials(accessKey, secretKey, bucketName, region string) 
 }
 
 // Exists returns true if key exists in s3
-func (s *S3Store) Exists(key string) bool {
+func (s *S3Store) Exists(ctx context.Context, key string) bool {
 	input := &s3.GetObjectInput{
 		Bucket: s.bucket,
-		Key:    aws.String(s.Filename(key)),
+		Key:    aws.String(s.Filename(ctx, key)),
 	}
-	_, err := s.client.GetObject(context.Background(), input)
+	_, err := s.client.GetObject(ctx, input)
 	if err == nil {
 		return true
 	}
@@ -95,14 +95,14 @@ func (s *S3Store) Exists(key string) bool {
 }
 
 // Store saves value at key.
-func (s *S3Store) Store(key string, value []byte) error {
-	filename := s.Filename(key)
+func (s *S3Store) Store(ctx context.Context, key string, value []byte) error {
+	filename := s.Filename(ctx, key)
 	input := &s3.PutObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(filename),
 		Body:   bytes.NewReader(value),
 	}
-	_, err := s.client.PutObject(context.Background(), input)
+	_, err := s.client.PutObject(ctx, input)
 
 	if err != nil {
 		return err
@@ -111,12 +111,12 @@ func (s *S3Store) Store(key string, value []byte) error {
 }
 
 // Load retrieves the value at key.
-func (s *S3Store) Load(key string) ([]byte, error) {
+func (s *S3Store) Load(ctx context.Context, key string) ([]byte, error) {
 	input := &s3.GetObjectInput{
 		Bucket: s.bucket,
-		Key:    aws.String(s.Filename(key)),
+		Key:    aws.String(s.Filename(ctx, key)),
 	}
-	result, err := s.client.GetObject(context.Background(), input)
+	result, err := s.client.GetObject(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -129,12 +129,12 @@ func (s *S3Store) Load(key string) ([]byte, error) {
 }
 
 // Delete deletes the value at key.
-func (s *S3Store) Delete(key string) error {
+func (s *S3Store) Delete(ctx context.Context, key string) error {
 	input := &s3.DeleteObjectInput{
 		Bucket: s.bucket,
-		Key:    aws.String(s.Filename(key)),
+		Key:    aws.String(s.Filename(ctx, key)),
 	}
-	_, err := s.client.DeleteObject(context.Background(), input)
+	_, err := s.client.DeleteObject(ctx, input)
 	if err != nil {
 		return err
 	}
@@ -145,15 +145,15 @@ func (s *S3Store) Delete(key string) error {
 // because s3 has no concept of directories, everything is an explicit path,
 // there is really no such thing as recursive search. This is simply
 // here to fulfill the interface requirements of the List function
-func (s *S3Store) List(prefix string, recursive bool) ([]string, error) {
+func (s *S3Store) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
 	var keys []string
-	prefixPath := s.Filename(prefix)
+	prefixPath := s.Filename(ctx, prefix)
 	input := &s3.ListObjectsInput{
 		Bucket: s.bucket,
 		Prefix: aws.String(prefixPath),
 	}
 
-	result, err := s.client.ListObjects(context.Background(), input)
+	result, err := s.client.ListObjects(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -167,12 +167,12 @@ func (s *S3Store) List(prefix string, recursive bool) ([]string, error) {
 }
 
 // Stat returns information about key.
-func (s *S3Store) Stat(key string) (cm.KeyInfo, error) {
+func (s *S3Store) Stat(ctx context.Context, key string) (cm.KeyInfo, error) {
 	input := &s3.GetObjectInput{
 		Bucket: s.bucket,
 		Key:    aws.String(key),
 	}
-	result, err := s.client.GetObject(context.Background(), input)
+	result, err := s.client.GetObject(ctx, input)
 
 	if err != nil {
 		return cm.KeyInfo{}, err
@@ -188,7 +188,7 @@ func (s *S3Store) Stat(key string) (cm.KeyInfo, error) {
 
 // Filename returns the key as a path on the file
 // system prefixed by S3Storage.Path.
-func (s *S3Store) Filename(key string) string {
+func (s *S3Store) Filename(_ context.Context, key string) string {
 	return filepath.Join(s.prefix, filepath.FromSlash(key))
 }
 
@@ -199,7 +199,7 @@ func (s *S3Store) Lock(ctx context.Context, key string) error {
 	lockFile := s.lockFileName(key)
 
 	for {
-		err := s.createLockFile(lockFile)
+		err := s.createLockFile(ctx, lockFile)
 		if err == nil {
 			// got the lock, yay
 			return nil
@@ -214,7 +214,7 @@ func (s *S3Store) Lock(ctx context.Context, key string) error {
 
 		// lock file already exists
 
-		info, err := s.Stat(lockFile)
+		info, err := s.Stat(ctx, lockFile)
 		switch {
 		case s.errNoSuchKey(err):
 			// must have just been removed; try again to create it
@@ -245,7 +245,7 @@ func (s *S3Store) Lock(ctx context.Context, key string) error {
 }
 
 // Unlock releases the lock for name.
-func (s *S3Store) Unlock(key string) error {
+func (s *S3Store) Unlock(_ context.Context, key string) error {
 	return s.deleteLockFile(s.lockFileName(key))
 }
 
@@ -265,9 +265,9 @@ func (s *S3Store) fileLockIsStale(info cm.KeyInfo) bool {
 	return time.Since(info.Modified) > staleLockDuration
 }
 
-func (s *S3Store) createLockFile(filename string) error {
+func (s *S3Store) createLockFile(ctx context.Context, filename string) error {
 	//lf := s.lockFileName(key)
-	exists := s.Exists(filename)
+	exists := s.Exists(ctx, filename)
 	if exists {
 		return fmt.Errorf(lockFileExists)
 	}
